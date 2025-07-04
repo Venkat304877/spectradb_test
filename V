@@ -1,0 +1,90 @@
+#!/bin/bash
+
+echo "🔍 Searching for *.sql files..."
+SQL_FILES=$(find . -type f -name "*.sql")
+
+if [[ -z "$SQL_FILES" ]]; then
+  echo "❌ No .sql files found!"
+  exit 1
+fi
+
+for SQL_FILE in $SQL_FILES; do
+  echo "---------------------------------------"
+  echo "➡️ File: $SQL_FILE"
+
+  # Extract procedure/function name and type
+  META=$(grep -iE 'CREATE[[:space:]]+(DEFINER[[:space:]]*=[^ ]+[[:space:]]*)?(PROCEDURE|FUNCTION)[[:space:]]+`?[^` (]+`?' "$SQL_FILE" | head -n1)
+
+  if [[ -z "$META" ]]; then
+    echo "⚠️  No PROCEDURE or FUNCTION found — skipping."
+    continue
+  fi
+
+  TYPE=$(echo "$META" | grep -iEo 'PROCEDURE|FUNCTION')
+  NAME=$(echo "$META" | sed -E 's/.*(PROCEDURE|FUNCTION)[[:space:]]+`?([^` (]+)`?.*/\2/I')
+
+  echo "➡️ SP/FN Name: $NAME"
+  echo "📚 Detected TYPE: $TYPE"
+
+  # Check existence in DB
+  EXISTS=$(mysql -N -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "
+    SELECT COUNT(*) FROM INFORMATION_SCHEMA.ROUTINES 
+    WHERE ROUTINE_SCHEMA = '$DB_NAME' AND ROUTINE_TYPE = UPPER('$TYPE') AND ROUTINE_NAME = '$NAME';
+  ")
+
+  if [[ "$EXISTS" -eq 1 ]]; then
+    echo "✅ $TYPE $NAME exists — comparing definitions..."
+
+    # Get current definition
+    mysql -N -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e \
+      "SHOW CREATE $TYPE \`$NAME\`;" | sed -E 's/\t/ /g' > "__db_create.sql"
+
+    # Normalize SQL file definition
+    awk '/CREATE/,/END[[:space:]]*$/ { print }' "$SQL_FILE" | \
+      sed -E 's/DEFINER[[:space:]]*=[^ ]+[[:space:]]*//g; s/\s+/ /g' > "__file_create.sql"
+
+    # Strip DEFINER and compress whitespace from DB side
+    sed -i -E 's/DEFINER[[:space:]]*=[^ ]+[[:space:]]*//g; s/\s+/ /g' __db_create.sql
+
+    db_hash=$(md5sum __db_create.sql | cut -d ' ' -f1)
+    file_hash=$(md5sum __file_create.sql | cut -d ' ' -f1)
+
+    if [[ "$db_hash" == "$file_hash" ]]; then
+      echo "✅ No changes detected — skipping deploy for $NAME"
+      rm -f __db_create.sql __file_create.sql
+      continue
+    else
+      echo "🔄 Changes detected — dropping existing $TYPE $NAME"
+      mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "DROP $TYPE IF EXISTS \`$NAME\`;"
+      rm -f __db_create.sql __file_create.sql
+    fi
+  else
+    echo "🆕 $TYPE $NAME does not exist — will create new."
+  fi
+
+  # Temp validation
+  TEMP_NAME="${NAME}_temp"
+  sed -E "s/(CREATE[[:space:]]+)(PROCEDURE|FUNCTION)[[:space:]]+`?$NAME`?/\\1\\2 \`$TEMP_NAME\`/I" "$SQL_FILE" > "__temp.sql"
+
+  echo "📤 Testing temp: $TEMP_NAME"
+  mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" < "__temp.sql"
+
+  if [[ $? -ne 0 ]]; then
+    echo "❌ Temp validation failed — skipping $NAME"
+    rm -f "__temp.sql"
+    continue
+  fi
+
+  echo "✅ Temp validated — cleaning up"
+  mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "DROP $TYPE IF EXISTS \`$TEMP_NAME\`;"
+  rm -f "__temp.sql"
+
+  echo "🚀 Deploying: $NAME"
+  mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" < "$SQL_FILE"
+
+  if [[ $? -eq 0 ]]; then
+    echo "✅ Deployed successfully: $NAME"
+  else
+    echo "❌ Deployment failed: $NAME"
+  fi
+done
